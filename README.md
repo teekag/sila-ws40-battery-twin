@@ -2,6 +2,8 @@
 
 A comprehensive digital twin implementation for the Sila Nanotechnologies WS40 silicon anode lithium-ion battery, integrating multi-physics modeling with real-time monitoring and predictive analytics.
 
+[Blank diagram-2.pdf](https://github.com/user-attachments/files/19197644/Blank.diagram-2.pdf)
+
 ## Overview
 
 This project creates a digital replica of the Sila WS40 battery, incorporating:
