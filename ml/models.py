@@ -1,3 +1,11 @@
+"""
+ML models for battery state prediction and degradation estimation.
+
+This module provides:
+- LSTM model for sequence-based predictions
+- GPR model for uncertainty quantification
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -26,23 +34,53 @@ class BatteryLSTM(nn.Module):
         )
         
         # Output layers for different predictions
-        self.fc_soc = nn.Linear(hidden_size, 1)
-        self.fc_voltage = nn.Linear(hidden_size, 1)
-        self.fc_temperature = nn.Linear(hidden_size, 1)
-        self.fc_soh = nn.Linear(hidden_size, 1)
-        self.fc_rul = nn.Linear(hidden_size, 1)
+        self.fc_soc = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1),
+            nn.Sigmoid()
+        )
+        
+        self.fc_voltage = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        
+        self.fc_temperature = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1)
+        )
+        
+        self.fc_soh = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1),
+            nn.Sigmoid()
+        )
+        
+        self.fc_rul = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1),
+            nn.ReLU()  # RUL should be non-negative
+        )
         
     def forward(self, x: torch.Tensor, hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None) -> Dict[str, torch.Tensor]:
         """Forward pass through the network."""
         # LSTM forward pass
-        lstm_out, hidden = self.lstm(x, hidden)
+        lstm_out, hidden = self.lstm(x, hidden)  # lstm_out shape: [batch, seq_len, hidden_size]
+        
+        # Get predictions from the last timestep
+        last_hidden = lstm_out[:, -1, :]  # shape: [batch, hidden_size]
         
         # Get predictions for each output
-        soc = torch.sigmoid(self.fc_soc(lstm_out))
-        voltage = self.fc_voltage(lstm_out)
-        temperature = self.fc_temperature(lstm_out)
-        soh = torch.sigmoid(self.fc_soh(lstm_out))
-        rul = torch.relu(self.fc_rul(lstm_out))
+        soc = self.fc_soc(last_hidden)
+        voltage = self.fc_voltage(last_hidden)
+        temperature = self.fc_temperature(last_hidden)
+        soh = self.fc_soh(last_hidden)
+        rul = self.fc_rul(last_hidden)
         
         return {
             'soc': soc,
