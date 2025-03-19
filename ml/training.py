@@ -1,3 +1,11 @@
+"""
+Training module for battery prediction models.
+
+This module provides training utilities for:
+- LSTM model for sequence-based predictions
+- GPR model for uncertainty quantification
+"""
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -9,7 +17,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 import pandas as pd
 
-from .models import BatteryPredictor
+from ml.models import BatteryPredictor
 
 logger = logging.getLogger(__name__)
 
@@ -37,98 +45,169 @@ class BatteryModelTrainer:
         self.bce_loss = nn.BCELoss()
         
     def prepare_sequences(self, 
-                         data: Dict[str, np.ndarray],
-                         sequence_length: int
+                         data: Dict[str, np.ndarray]
                          ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """Prepare sequential data for training."""
-        # Get data dimensions
-        n_samples = len(data['current'])
-        n_sequences = n_samples - sequence_length
-        
-        # Prepare input sequences
-        X = []
-        y = {k: [] for k in ['soc', 'voltage', 'temperature', 'soh', 'rul']}
-        
-        for i in range(n_sequences):
-            # Input sequence
-            seq = np.stack([
-                data['current'][i:i+sequence_length],
-                data['voltage'][i:i+sequence_length],
-                data['temperature'][i:i+sequence_length],
-                data['soc'][i:i+sequence_length],
-                data.get('capacity', np.ones(n_samples))[i:i+sequence_length]
-            ], axis=-1)
-            X.append(seq)
+        try:
+            # Get data dimensions
+            n_samples = len(data['current'])
+            n_sequences = n_samples - self.sequence_length
             
-            # Target values (next timestep)
-            y['soc'].append(data['soc'][i+sequence_length])
-            y['voltage'].append(data['voltage'][i+sequence_length])
-            y['temperature'].append(data['temperature'][i+sequence_length])
-            y['soh'].append(data.get('soh', np.ones(n_samples))[i+sequence_length])
-            y['rul'].append(data.get('rul', np.zeros(n_samples))[i+sequence_length])
-        
-        # Convert to tensors
-        X = torch.FloatTensor(np.array(X)).to(self.model.device)
-        y = {k: torch.FloatTensor(np.array(v)).to(self.model.device)
-             for k, v in y.items()}
-        
-        return X, y
+            if n_sequences <= 0:
+                raise ValueError(f"Sequence length {self.sequence_length} is too long for data with {n_samples} samples")
+            
+            # Prepare input sequences
+            sequences = []
+            targets = {k: [] for k in ['soc', 'voltage', 'temperature', 'soh', 'rul']}
+            
+            for i in range(n_sequences):
+                # Input sequence
+                seq = np.stack([
+                    data['current'][i:i+self.sequence_length],
+                    data['voltage'][i:i+self.sequence_length],
+                    data['temperature'][i:i+self.sequence_length],
+                    data['soc'][i:i+self.sequence_length],
+                    data.get('capacity', np.ones(n_samples))[i:i+self.sequence_length]
+                ], axis=1)  # Stack along feature dimension
+                sequences.append(seq)
+                
+                # Target values (next timestep)
+                next_idx = i + self.sequence_length
+                targets['soc'].append(data['soc'][next_idx])
+                targets['voltage'].append(data['voltage'][next_idx])
+                targets['temperature'].append(data['temperature'][next_idx])
+                targets['soh'].append(data.get('soh', np.ones(n_samples))[next_idx])
+                targets['rul'].append(data.get('rul', np.zeros(n_samples))[next_idx])
+            
+            # Convert to tensors
+            X = torch.FloatTensor(np.array(sequences)).to(self.model.device)  # Shape: [batch, seq_len, features]
+            y = {k: torch.FloatTensor(np.array(v)).to(self.model.device)
+                 for k, v in targets.items()}
+            
+            return X, y
+            
+        except Exception as e:
+            logger.error(f"Error preparing sequences: {str(e)}")
+            raise
         
     def train_epoch(self, 
                     train_data: Tuple[torch.Tensor, Dict[str, torch.Tensor]]
                     ) -> Dict[str, float]:
         """Train for one epoch."""
-        self.model.lstm.train()
-        total_loss = 0
-        losses = {k: 0.0 for k in ['soc', 'voltage', 'temperature', 'soh', 'rul']}
+        try:
+            self.model.lstm.train()
+            total_loss = 0
+            losses = {k: 0.0 for k in ['soc', 'voltage', 'temperature', 'soh', 'rul']}
+            
+            X, y = train_data
+            n_samples = len(X)
+            
+            if n_samples == 0:
+                raise ValueError("No training samples available")
+                
+            n_batches = (n_samples + self.batch_size - 1) // self.batch_size
+            
+            for i in range(n_batches):
+                # Get batch
+                start_idx = i * self.batch_size
+                end_idx = min(start_idx + self.batch_size, n_samples)
+                
+                batch_X = X[start_idx:end_idx]
+                batch_y = {k: v[start_idx:end_idx] for k, v in y.items()}
+                
+                # Zero gradients
+                self.optimizer.zero_grad()
+                
+                # Forward pass
+                predictions = self.model.lstm(batch_X)
+                
+                # Calculate losses
+                loss = 0
+                for k in losses.keys():
+                    if k in ['soc', 'soh']:
+                        # Binary cross entropy for bounded [0,1] values
+                        k_loss = self.bce_loss(
+                            predictions[k].squeeze(),
+                            batch_y[k]
+                        )
+                    else:
+                        # MSE for unbounded values
+                        k_loss = self.mse_loss(
+                            predictions[k].squeeze(),
+                            batch_y[k]
+                        )
+                    losses[k] += k_loss.item() * (end_idx - start_idx)
+                    loss += k_loss
+                
+                # Backward pass
+                loss.backward()
+                self.optimizer.step()
+                
+                total_loss += loss.item() * (end_idx - start_idx)
+            
+            # Average losses
+            return {
+                'total_loss': total_loss / n_samples,
+                **{k: v / n_samples for k, v in losses.items()}
+            }
+            
+        except Exception as e:
+            logger.error(f"Error during training: {str(e)}")
+            raise
         
-        X, y = train_data
-        n_batches = len(X) // self.batch_size
-        
-        for i in range(n_batches):
-            # Get batch
-            start_idx = i * self.batch_size
-            end_idx = start_idx + self.batch_size
+    def validate(self,
+                val_data: Tuple[torch.Tensor, Dict[str, torch.Tensor]]
+                ) -> Dict[str, float]:
+        """Validate the model."""
+        try:
+            self.model.lstm.eval()
+            total_loss = 0
+            losses = {k: 0.0 for k in ['soc', 'voltage', 'temperature', 'soh', 'rul']}
             
-            batch_X = X[start_idx:end_idx]
-            batch_y = {k: v[start_idx:end_idx] for k, v in y.items()}
+            X, y = val_data
+            n_samples = len(X)
             
-            # Zero gradients
-            self.optimizer.zero_grad()
+            if n_samples == 0:
+                raise ValueError("No validation samples available")
             
-            # Forward pass
-            predictions = self.model.lstm(batch_X)
+            with torch.no_grad():
+                n_batches = (n_samples + self.batch_size - 1) // self.batch_size
+                
+                for i in range(n_batches):
+                    # Get batch
+                    start_idx = i * self.batch_size
+                    end_idx = min(start_idx + self.batch_size, n_samples)
+                    
+                    batch_X = X[start_idx:end_idx]
+                    batch_y = {k: v[start_idx:end_idx] for k, v in y.items()}
+                    
+                    # Forward pass
+                    predictions = self.model.lstm(batch_X)
+                    
+                    # Calculate losses
+                    for k in losses.keys():
+                        if k in ['soc', 'soh']:
+                            k_loss = self.bce_loss(
+                                predictions[k].squeeze(),
+                                batch_y[k]
+                            )
+                        else:
+                            k_loss = self.mse_loss(
+                                predictions[k].squeeze(),
+                                batch_y[k]
+                            )
+                        losses[k] += k_loss.item() * (end_idx - start_idx)
+                        total_loss += k_loss.item() * (end_idx - start_idx)
             
-            # Calculate losses
-            loss = 0
-            for k in losses.keys():
-                if k in ['soc', 'soh']:
-                    # Binary cross entropy for bounded [0,1] values
-                    k_loss = self.bce_loss(
-                        predictions[k].squeeze(),
-                        batch_y[k]
-                    )
-                else:
-                    # MSE for unbounded values
-                    k_loss = self.mse_loss(
-                        predictions[k].squeeze(),
-                        batch_y[k]
-                    )
-                losses[k] += k_loss.item()
-                loss += k_loss
+            # Average losses
+            return {
+                'total_loss': total_loss / n_samples,
+                **{k: v / n_samples for k, v in losses.items()}
+            }
             
-            # Backward pass
-            loss.backward()
-            self.optimizer.step()
-            
-            total_loss += loss.item()
-            
-        # Average losses
-        n_samples = n_batches * self.batch_size
-        return {
-            'total_loss': total_loss / n_samples,
-            **{k: v / n_samples for k, v in losses.items()}
-        }
+        except Exception as e:
+            logger.error(f"Error during validation: {str(e)}")
+            raise
         
     def train(self,
               train_data: Dict[str, np.ndarray],
@@ -141,21 +220,17 @@ class BatteryModelTrainer:
             logger.info("Starting model training...")
             
             # Prepare data
-            train_sequences = self.prepare_sequences(
-                train_data,
-                self.sequence_length
-            )
+            train_sequences = self.prepare_sequences(train_data)
             
             if val_data is not None:
-                val_sequences = self.prepare_sequences(
-                    val_data,
-                    self.sequence_length
-                )
+                val_sequences = self.prepare_sequences(val_data)
             
             # Training history
             history = {
                 'train_loss': [],
-                'val_loss': [] if val_data is not None else None
+                'val_loss': [] if val_data is not None else None,
+                'train_metrics': [],
+                'val_metrics': [] if val_data is not None else None
             }
             
             # Early stopping
@@ -167,11 +242,17 @@ class BatteryModelTrainer:
                 # Train
                 train_losses = self.train_epoch(train_sequences)
                 history['train_loss'].append(train_losses['total_loss'])
+                history['train_metrics'].append({
+                    k: v for k, v in train_losses.items() if k != 'total_loss'
+                })
                 
                 # Validate
                 if val_data is not None:
                     val_losses = self.validate(val_sequences)
                     history['val_loss'].append(val_losses['total_loss'])
+                    history['val_metrics'].append({
+                        k: v for k, v in val_losses.items() if k != 'total_loss'
+                    })
                     
                     # Early stopping check
                     if val_losses['total_loss'] < best_val_loss:
@@ -180,10 +261,8 @@ class BatteryModelTrainer:
                         
                         # Save best model
                         if model_dir is not None:
-                            self.save_checkpoint(
-                                Path(model_dir) / 'best_model.pt',
-                                epoch,
-                                val_losses['total_loss']
+                            self.model.save_model(
+                                str(Path(model_dir) / 'best_model.pt')
                             )
                     else:
                         patience_counter += 1
@@ -206,38 +285,6 @@ class BatteryModelTrainer:
         except Exception as e:
             logger.error(f"Error during training: {str(e)}")
             raise
-            
-    def validate(self,
-                val_data: Tuple[torch.Tensor, Dict[str, torch.Tensor]]
-                ) -> Dict[str, float]:
-        """Validate the model."""
-        self.model.lstm.eval()
-        
-        with torch.no_grad():
-            X, y = val_data
-            predictions = self.model.lstm(X)
-            
-            losses = {}
-            total_loss = 0
-            
-            # Calculate losses
-            for k in y.keys():
-                if k in ['soc', 'soh']:
-                    loss = self.bce_loss(
-                        predictions[k].squeeze(),
-                        y[k]
-                    ).item()
-                else:
-                    loss = self.mse_loss(
-                        predictions[k].squeeze(),
-                        y[k]
-                    ).item()
-                losses[k] = loss
-                total_loss += loss
-            
-            losses['total_loss'] = total_loss / len(y)
-            
-        return losses
         
     def save_checkpoint(self,
                        path: Path,
